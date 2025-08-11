@@ -1,27 +1,27 @@
-name: Fetch MLB Games Daily
+name: Fetch MLB Data
 
 on:
   schedule:
-    - cron: '0 14 * * *'  # Run daily at 7am PT / 10am ET
-  workflow_dispatch:      # Allow manual run
+    - cron: "0 * * * *" # every hour
+  workflow_dispatch:
 
 jobs:
-  fetch-and-upload:
+  fetch-mlb-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests supabase
 
-      - name: Run script
+      - name: Run fetch script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python fetch_mlb_games.py
+        run: python fetch_mlb_data.py
