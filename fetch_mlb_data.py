@@ -1,3 +1,4 @@
+
 import os
 import requests
 from datetime import datetime, timezone, timedelta
@@ -14,11 +15,23 @@ def upsert(table: str, rows: list, conflict_cols: list):
         print(f"[INFO] No rows to insert for table: {table}")
         return
     print(f"[INFO] Upserting {len(rows)} rows into {table}")
-    response = supabase.table(table).upsert(rows, on_conflict=conflict_cols).execute()
-    if hasattr(response, "data"):
-        print(f"[SUCCESS] {len(response.data)} rows upserted into {table}")
+    
+    # For composite keys, we need to specify the columns in a specific format
+    if len(conflict_cols) > 1:
+        # Join multiple columns with comma for composite key
+        conflict_spec = ",".join(conflict_cols)
     else:
-        print(f"[WARNING] No response data for {table}")
+        conflict_spec = conflict_cols[0]
+    
+    try:
+        response = supabase.table(table).upsert(rows, on_conflict=conflict_spec).execute()
+        if hasattr(response, "data"):
+            print(f"[SUCCESS] {len(response.data)} rows upserted into {table}")
+        else:
+            print(f"[WARNING] No response data for {table}")
+    except Exception as e:
+        print(f"[ERROR] Failed to upsert into {table}: {e}")
+        raise
 
 # --- Fetch today's games ---
 def fetch_games():
@@ -47,21 +60,25 @@ def fetch_standings():
     r = requests.get(url)
     data = r.json()
 
+    # Get season with fallback to current year
+    season = data.get("season") or datetime.now().year
+
     standings = []
     for record in data.get("records", []):
+        division_name = record.get("division", {}).get("name")
         for team_record in record.get("teamRecords", []):
             team = team_record.get("team", {})
             standings.append({
-                "season": teamrec.get("season"),
-                "team_id": teamrec["team"]["id"],
-                "team_name": teamrec["team"]["name"],
+                "season": season,
+                "team_id": team_record["team"]["id"],
+                "team_name": team_record["team"]["name"],
                 "division": division_name,
-                "wins": teamrec["wins"],
-                "losses": teamrec["losses"],
-                "win_pct": float(teamrec["winningPercentage"]),
-                "games_back": float(teamrec.get("gamesBack", "0").replace("-", "0"))
+                "wins": team_record["wins"],
+                "losses": team_record["losses"],
+                "win_pct": float(team_record["winningPercentage"]),
+                "games_back": float(team_record.get("gamesBack", "0").replace("-", "0"))
             })
-    upsert("standings", standings, ["team_id"])
+    upsert("standings", standings, ["season", "team_id"])
 
 # --- Fetch player season stats (basic batting) ---
 def fetch_player_stats():
@@ -74,20 +91,36 @@ def fetch_player_stats():
         for split in row.get("splits", []):
             player = split.get("player", {})
             stat = split.get("stat", {})
-            player_season_stats.append({
-                "player_id": player.get("id"),
-                "season": date.today().year,
-                "team_id": p["team_id"],
-                "player_name": player.get("fullName"),
-                "games_played": stat.get("gamesPlayed"),
-                "avg": float(stat.get("avg", 0) or 0),
-                "ops": float(stat.get("ops", 0) or 0),
-                "hr": int(stat.get("homeRuns", 0) or 0),
-                "rbi": int(stat.get("rbi", 0) or 0),
-                "era": float(stat.get("era", 0) or 0),
-                "so": int(stat.get("strikeOuts", 0) or 0)
-            })
-    upsert("player_stats", player_stats, ["player_id"])
+            # Get team info from the split if available
+            team_info = split.get("team", {})
+            
+            # Clean and validate data before creating record
+            try:
+                record = {
+                    "player_id": int(player.get("id")) if player.get("id") else None,
+                    "season": int(datetime.now().year),
+                    "team_id": int(team_info.get("id")) if team_info.get("id") else None,
+                    "player_name": str(player.get("fullName")) if player.get("fullName") else None,
+                    "games_played": int(stat.get("gamesPlayed", 0)) if stat.get("gamesPlayed") else 0,
+                    "avg": float(stat.get("avg", 0) or 0),
+                    "ops": float(stat.get("ops", 0) or 0),
+                    "hr": int(stat.get("homeRuns", 0) or 0),
+                    "rbi": int(stat.get("rbi", 0) or 0),
+                    "era": float(stat.get("era", 0) or 0),
+                    "so": int(stat.get("strikeOuts", 0) or 0)
+                }
+                
+                # Validate that required fields are not None
+                if record["player_id"] is not None and record["team_id"] is not None:
+                    player_stats.append(record)
+                else:
+                    print(f"[WARNING] Skipping player with missing required fields: {record}")
+                    
+            except (ValueError, TypeError) as e:
+                print(f"[WARNING] Error processing player {player.get('fullName', 'Unknown')}: {e}")
+                continue
+    
+    upsert("player_season_stats", player_stats, ["player_id", "season"])
 
 # --- Fetch next 7 days' schedule ---
 def fetch_schedule():
@@ -102,7 +135,7 @@ def fetch_schedule():
         for game in date.get("games", []):
             schedule.append({
                 "game_id": game.get("gamePk"),
-                "game_date": game.get("gameDate"),
+                "date": game.get("gameDate"),
                 "home_team": game.get("teams", {}).get("home", {}).get("team", {}).get("name"),
                 "away_team": game.get("teams", {}).get("away", {}).get("team", {}).get("name"),
             })
@@ -111,18 +144,22 @@ def fetch_schedule():
 # --- Fetch team stats ---
 def fetch_team_stats(season=None):
     if season is None:
-        season = datetime.now(UTC).year
+        season = datetime.now(timezone.utc).year
 
     url = f"https://statsapi.mlb.com/api/v1/teams/stats?season={season}&sportIds=1&group=hitting,pitching,fielding"
-    print(f"[INFO] Fetching team stats for {season} from {url}")
+    print(f"[INFO] Fetching team stats for {season}")
     resp = requests.get(url)
     resp.raise_for_status()
     data = resp.json()
 
     team_stats = []
     for team in data.get("stats", []):
-        team_info = team.get("team", {})
         stat_splits = team.get("splits", [])
+        
+        # Get team info from the first split (they all have the same team info)
+        team_info = {}
+        if stat_splits:
+            team_info = stat_splits[0].get("team", {})
 
         # We'll combine hitting and pitching into one row
         row = {
@@ -144,7 +181,7 @@ def fetch_team_stats(season=None):
             "walks": None,
             "stolen_bases": None,
             "caught_stealing": None,
-            "updated_at": datetime.now(UTC).isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }
 
         for split in stat_splits:
@@ -170,7 +207,16 @@ def fetch_team_stats(season=None):
                 row["walks"] = int(stats.get("baseOnBalls", 0))
                 row["runs_allowed"] = int(stats.get("runs", 0))
 
-        team_stats.append(row)
+        # Only add rows that have valid team_id
+        if row["team_id"] is not None:
+            team_stats.append(row)
+        else:
+            print(f"[WARNING] Skipping team with no team_id: {row}")
+
+    # Don't try to upsert if we have no valid records
+    if not team_stats:
+        print(f"[WARNING] No valid team stats to upsert")
+        return
 
     upsert("team_stats", team_stats, ["season", "team_id"])
 
